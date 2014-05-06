@@ -1,8 +1,13 @@
+/*
+Inspirations and helps :
+Pid control source : http://www.flashingleds.net/sousvader/sousvader.html
+Triac bucketting : http://www.rotwang.co.uk/projects/triac.html
+*/
 
 #include <avr/io.h>
 #include <util/delay.h>
 #include <avr/interrupt.h>
-
+#include "lut.h"
 
 #define TIMER_FIRED 1
 #define BaudRate 9600
@@ -24,6 +29,8 @@ long temp_long;
 char buffer[BUFF_LEN];
 
 #define DEBUG
+
+#define COUNTS(n) ((n) << 1)
 
 void delayLong()
 {
@@ -71,17 +78,44 @@ void tempfromTCReadValue(){
   ColdJunctionTfloatPart = (TCReadValue>>4) & 0xf;
 }
 
+volatile unsigned int power_wait = 0xffff;
+
+
 ISR(INT0_vect)
 {
-    // user code here
-  interrupt_count++;
- 
+  // zero crossing
+
+  if(power_wait){
+    PORTB &= ~  (1<<PB1);
+    OCR1A = power_wait;
+    // shut down triac driver pin
+    TCCR1B |= (1 << WGM12); // CTC mode : p 136
+    TIMSK1 |= (1 << OCIE1A); // Enable CTC interrupt 
+    TCCR1B |= (1 << CS11); // start timer prescal = 8;
+  }
+  interrupt_count++; 
 }
 
 ISR(TIMER1_COMPA_vect) 
+{ 
+  PORTB |=  (1<<PB1);; //  triac driver pin -> on
+  TCCR1B = 0; // stop timer
+}
+
+volatile timer_counter = 61;
+ISR(TIMER0_COMPA_vect) 
 {  
- main_flags |= TIMER_FIRED;
+
+  if(timer_counter==1){
+    OCR0A   = 70;
+  }
+ if(!timer_counter){
+    main_flags |= TIMER_FIRED;
     PORTB ^= _BV(PORTB5);
+    OCR0A   = 255;
+    timer_counter = 61;
+ }
+    timer_counter--;
 }
 
 
@@ -147,12 +181,20 @@ int main (void)
 
 
 // Timer Initialization
-TCCR1B |= (1 << WGM12); // Configure timer 1 for CTC mode
+
+// timer 0 : 8 bit
+TCCR0A |= (1 << WGM01); // Configure timer 0 for CTC mode
+TIMSK0 |= (1 << OCIE0A); // Enable CTC interrupt 
+ OCR0A   = 255;
+// Set CTC compare value to 61Hz at 16MHz AVR clock, with a prescaler of 1024
+// the interrupt code triggers temp read every 60 calls @ 255 + 1 @70
+//OCR1A   = 7812; // Set CTC compare value to 2Hz at 16MHz AVR clock, with a prescaler of 1024
+
+
+// timer 1 : 16 bit
+TCCR1B |= (1 << WGM12); // CTC mode : p 136
 TIMSK1 |= (1 << OCIE1A); // Enable CTC interrupt 
-//OCR1A   = 15624; // Set CTC compare value to 1Hz at 16MHz AVR clock, with a prescaler of 1024
-OCR1A   = 7812; // Set CTC compare value to 1Hz at 16MHz AVR clock, with a prescaler of 1024
-
-
+OCR1A   =  COUNTS(LUT50hz[0]); // start at 0%
 
 // Zero Crossing Initialization
 DDRD  &= ~(1<<PD2); // PD2 input
@@ -162,55 +204,101 @@ EIMSK |= (1 << INT0); // enable interrupt
 
 // TCouple reader chip init
 
-DDRC  |=   (1<<PC4);
+DDRC  |=   (1<<PC4);// PC4 output -> chip sel
 PORTC |=   (1<<PC4); // CS HI -> inactive;
-DDRC  |=   (1<<PC5);
+DDRC  |=   (1<<PC5);// PC5 output -> clck
 PORTC &=  ~(1<<PC5); // clock active hi;
 
 DDRC  &= ~(1<<PC3); // PC3 input for SO
 PORTC |=  (1<<PC3); // disable pull up
 
-sei(); 
+DDRB  |=  (1<<PB1); // PB1 output -> triac driving
 
-TCCR1B |= (1 << CS10)|(1 << CS12); // Start up timer, prescaler 1024 (DSheet 328p page 137)
+
+
+
+
+sei(); // enable interrupts
+
+//before starting timers
+power_wait = COUNTS(LUT50hz[0]); // 0%
+ // START Timers
+TCCR0B |= (1 << CS00)|(1 << CS02); // Start up timer0, prescaler 1024 (DSheet 328p page 110) -> 15625 ticks / sec
+TCCR1B |= (1 << CS11);             // Start up timer0, prescaler    8 (DSheet 328p page 116) 
+// -> 2000000 ticks / sec
+// 1 pulse (50hz)   -> 40000 pulses 
+// -> zero crossing -> 20000 pulses
+// bins are in usec
+
+//#define COUNTS(n) ((n) << 1) // defined higher
 
  char i = 0;
+ char j = 0;
+ char dir = 1;
  int temp;
 
  for(i=0;i<10;i++) buffer[i] = 0;
 
- char * mark = "EEERCCCCCCCCCCCSFRHHHHHHHHHHHHHH";
+ //char * mark = "EEERCCCCCCCCCCCSFRHHHHHHHHHHHHHH";
  //             00001101010010000001110000111111
  banner();
  
+
+
+
+
  while(1) {
  
    if(main_flags & TIMER_FIRED){
 #ifdef DEBUG  
     
-     serialWriteStrLn(buffer+longtobuffer(interrupt_count,buffer));
+     // serialWriteStrLn(buffer+longtobuffer(interrupt_count,buffer));
      interrupt_count =0; 
-     main_flags &= ~TIMER_FIRED;
-     serialWrite('\r');serialWrite('\n');
+     //main_flags &= ~TIMER_FIRED;
+     //serialWrite('\r');serialWrite('\n');
 #endif
    
       
      ReadTC();
      temp_long = TCReadValue;
-     serialWriteStrLn(mark);
-     for(i=0;i<32;i++){
-       serialWrite( ( (temp_long & 0b1) +'0') );
-       temp_long>>=1;
-     }
-     serialWriteLn();
-    
+
+#ifdef DEBUG  
+     //     serialWriteStrLn(mark);
+     //for(i=0;i<32;i++){
+     //  serialWrite( ( (temp_long & 0b1) +'0') );
+     //  temp_long>>=1;
+     //}
+     //serialWriteLn();
+ #endif   
+     tempfromTCReadValue();
+ #ifdef DEBUG      
+     //serialWriteStrLn(buffer+longtobuffer(HotJunctionTintPart,buffer));
+     //serialWriteStrLn(buffer+longtobuffer(ColdJunctionTintPart,buffer));
+     //serialWriteLn();
+ #endif   
 
      
-     tempfromTCReadValue();
-     serialWriteStrLn(buffer+longtobuffer(HotJunctionTintPart,buffer));
-     serialWriteStrLn(buffer+longtobuffer(ColdJunctionTintPart,buffer));
-     
+
+     power_wait = COUNTS(LUT50hz[j-1]);
+     serialWriteStrLn(buffer+longtobuffer(j,buffer));
+     serialWriteStrLn(buffer+longtobuffer(power_wait,buffer));
      serialWriteLn();
+     if(dir){
+       j+=4;
+     }else{
+       j-=4;
+     }
+     if(j<0)       j=0;
+     if(j>100)     j=100;
+
+     if((j==0) || (j==100)){
+       dir = !dir;
+     }
+     
+     
+     
+
+     
      main_flags &= ~TIMER_FIRED;
      
      
