@@ -277,18 +277,21 @@ TCCR1B |= (1 << CS11);             // Start up timer0, prescaler    8 (DSheet 32
      //serialWriteLn();
  #endif   
 
-     
 
+     
+     
      power_wait = COUNTS(LUT50hz[j-1]);
      serialWriteStrLn(buffer+longtobuffer(j,buffer));
      serialWriteStrLn(buffer+longtobuffer(power_wait,buffer));
+     j++;
+     j--;
      serialWriteLn();
      if(dir){
        j+=4;
      }else{
        j-=4;
      }
-     if(j<0)       j=0;
+     if(j<1)       j=1;
      if(j>100)     j=100;
 
      if((j==0) || (j==100)){
