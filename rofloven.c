@@ -8,6 +8,7 @@ Triac bucketting : http://www.rotwang.co.uk/projects/triac.html
 #include <util/delay.h>
 #include <avr/interrupt.h>
 #include "lut.h"
+#include <avr/eeprom.h>
 
 #define TIMER_FIRED 1
 #define BaudRate 9600
@@ -31,6 +32,19 @@ char buffer[BUFF_LEN];
 #define DEBUG
 
 #define COUNTS(n) ((n) << 1)
+
+struct phase_characteristics {
+  int duration;
+  int target_temp;
+  int max_slope;
+};
+
+struct program {
+  struct phase_characteristics pre_soak;
+  struct phase_characteristics soak;
+  struct phase_characteristics reflow;
+  struct phase_characteristics cooling;
+};
 
 void delayLong()
 {
@@ -98,6 +112,7 @@ ISR(INT0_vect)
 
 ISR(TIMER1_COMPA_vect) 
 { 
+  if(power_wait !=  COUNTS(LUT50hz[0] )  )
   PORTB |=  (1<<PB1);; //  triac driver pin -> on
   TCCR1B = 0; // stop timer
 }
@@ -120,7 +135,7 @@ ISR(TIMER0_COMPA_vect)
 
 
 void banner(){
-  char * mess = "Refloven 1.0";
+  char * mess = "Refloven 1.0\r\n";
   serialWriteStrLn(mess);
 }
 
@@ -166,9 +181,13 @@ int main (void)
  char buffer[10];
  char buffer_rank;
 
-/* set pin 5 of PORTB for output*/
- DDRB |= _BV(DDB5);
-  
+ enum phases { PHASE_STOP, PHASE_PRE_SOAK, PHASE_SOAK, PHASE_REFLOW, PHASE_COOLING};
+ enum phases phase = PHASE_STOP ;
+	
+/* set pin 5 & 1 of PORTB for output*/
+ DDRB |= ((1<<PB1)|(1<<PB5));
+ PORTB &= ~  (1<<PB1); // put it down
+
 // Serial Initialization
 /*Set baud rate */ 
  UBRR0H = (unsigned char)(MYUBRR>>8); 
@@ -212,7 +231,7 @@ PORTC &=  ~(1<<PC5); // clock active hi;
 DDRC  &= ~(1<<PC3); // PC3 input for SO
 PORTC |=  (1<<PC3); // disable pull up
 
-DDRB  |=  (1<<PB1); // PB1 output -> triac driving
+
 
 
 
@@ -231,7 +250,7 @@ TCCR1B |= (1 << CS11);             // Start up timer0, prescaler    8 (DSheet 32
 // bins are in usec
 
 //#define COUNTS(n) ((n) << 1) // defined higher
-
+ long int curr_secs = 0;
  char i = 0;
  char j = 0;
  char dir = 1;
@@ -244,73 +263,207 @@ TCCR1B |= (1 << CS11);             // Start up timer0, prescaler    8 (DSheet 32
  banner();
  
 
+ struct program curr_prog;
+ 
+ curr_prog.pre_soak.duration = 40;
+ curr_prog.pre_soak.target_temp = 30;
+ curr_prog.pre_soak.max_slope = 3;
+ 
+ curr_prog.soak.duration = 180;
+ curr_prog.soak.target_temp = curr_prog.pre_soak.target_temp;
+ curr_prog.soak.max_slope = 0;
 
+ curr_prog.reflow.duration = 50;
+ curr_prog.reflow.target_temp = 100;
+ curr_prog.reflow.max_slope = (curr_prog.reflow.target_temp -  curr_prog.soak.target_temp )/ curr_prog.reflow.duration;
 
+ curr_prog.cooling.duration = 100;
+ curr_prog.cooling.target_temp = 20;
+ curr_prog.cooling.max_slope = (curr_prog.cooling.target_temp -  curr_prog.reflow.target_temp )/ curr_prog.cooling.duration;
+
+ float error_p;
+ float error_i;
+ float error_d;
+
+ float term_p=5;
+ float term_i;
+ float term_d;
+
+ int last_sec;
 
  while(1) {
- 
+   
    if(main_flags & TIMER_FIRED){
+     curr_secs++;
+     ReadTC();
+     temp_long = TCReadValue;
+     tempfromTCReadValue();
+
+
+
 #ifdef DEBUG  
     
      // serialWriteStrLn(buffer+longtobuffer(interrupt_count,buffer));
      interrupt_count =0; 
      //main_flags &= ~TIMER_FIRED;
      //serialWrite('\r');serialWrite('\n');
-#endif
-   
-      
-     ReadTC();
-     temp_long = TCReadValue;
-
-#ifdef DEBUG  
      //     serialWriteStrLn(mark);
      //for(i=0;i<32;i++){
      //  serialWrite( ( (temp_long & 0b1) +'0') );
      //  temp_long>>=1;
      //}
      //serialWriteLn();
- #endif   
-     tempfromTCReadValue();
- #ifdef DEBUG      
-     //serialWriteStrLn(buffer+longtobuffer(HotJunctionTintPart,buffer));
-     //serialWriteStrLn(buffer+longtobuffer(ColdJunctionTintPart,buffer));
+   serialWriteStr(buffer+longtobuffer(curr_secs,buffer));
+   serialWriteStr(";");
+   serialWriteStr(buffer+longtobuffer(HotJunctionTintPart,buffer));
+   if(HotJunctionTfloatPart){
+   serialWriteStr(".");
+   serialWriteStr(buffer+longtobuffer(HotJunctionTfloatPart*25,buffer));
+   }
+   serialWriteStr(";");
+   serialWriteStr(buffer+longtobuffer(power_wait,buffer));
+   serialWriteLn();
+
+#endif   
+   
+     
+   switch(phase){
+
+   case PHASE_STOP:
+     power_wait=COUNTS(LUT50hz[0]);
+     if(curr_secs > 5){
+       phase = PHASE_PRE_SOAK;
+       last_sec = curr_secs;
+        serialWriteStrLn("/////PRESOAK");
+     }
+     break;
+
+   case PHASE_PRE_SOAK:
+     ///////////////////////////////////////////
+     //  maintaining pid term for each phase  //
+     ///////////////////////////////////////////
+     term_p = 10;
+     ///////////////////////
+     error_p = ((curr_prog.pre_soak.target_temp) - (HotJunctionTintPart+HotJunctionTfloatPart*0.25));
+     if(error_p > 0){
+      error_p *= term_p;
+      if(error_p>99){
+	power_wait=COUNTS(LUT50hz[99]);
+      }else{
+	power_wait=COUNTS(LUT50hz[(int)error_p]);
+      }
+     }else{
+       power_wait=COUNTS(LUT50hz[0]);
+     }
+     
+     if(curr_secs> (curr_prog.pre_soak.duration + last_sec)){
+       phase = PHASE_SOAK;
+       last_sec = curr_secs;
+        serialWriteStrLn("/////SOAK");
+       }
+     break;
+
+     
+     
+   case PHASE_SOAK:
+       
+      ///////////////////////////////////////////
+     //  maintaining pid term for each phase  //
+     ///////////////////////////////////////////
+     term_p = 10;
+     ///////////////////////
+      error_p = ((curr_prog.soak.target_temp) - (HotJunctionTintPart+HotJunctionTfloatPart*0.25));
+     if(error_p > 0){
+      error_p *= term_p;
+      if(error_p>99){
+	power_wait=COUNTS(LUT50hz[99]);
+      }else{
+	power_wait=COUNTS(LUT50hz[(int)error_p]);
+      }
+     }else{
+       power_wait=COUNTS(LUT50hz[0]);
+     }
+     
+     if(curr_secs> (curr_prog.soak.duration + last_sec)){
+        phase = PHASE_REFLOW;
+	last_sec = curr_secs;
+	serialWriteStrLn("/////REFLOW");
+     }
+
+     break;
+     
+   case PHASE_REFLOW:
+     ///////////////////////////////////////////
+     //  maintaining pid term for each phase  //
+     ///////////////////////////////////////////
+     term_p = 10;
+     ///////////////////////
+      error_p = ((curr_prog.reflow.target_temp) - (HotJunctionTintPart+HotJunctionTfloatPart*0.25));
+     if(error_p > 0){
+      error_p *= term_p;
+      if(error_p>99){
+	power_wait=COUNTS(LUT50hz[99]);
+      }else{
+	power_wait=COUNTS(LUT50hz[(int)error_p]);
+      }
+     }else{
+       power_wait=COUNTS(LUT50hz[0]);
+     }
+     if(curr_secs> (curr_prog.reflow.duration + last_sec)){
+        phase = PHASE_COOLING;
+	last_sec = curr_secs;
+	serialWriteStrLn("/////COOLING");
+      }
+     break;
+
+
+   case PHASE_COOLING:
+      ///////////////////////////////////////////
+     //  maintaining pid term for each phase  //
+     ///////////////////////////////////////////
+     term_p = 10;
+     ///////////////////////
+      error_p = ((curr_prog.cooling.target_temp) - (HotJunctionTintPart+HotJunctionTfloatPart*0.25));
+     if(error_p > 0){
+      error_p *= term_p;
+      if(error_p>99){
+	power_wait=COUNTS(LUT50hz[99]);
+      }else{
+	power_wait=COUNTS(LUT50hz[(int)error_p]);
+      }
+     }else{
+       power_wait=COUNTS(LUT50hz[0]);
+     }
+     if(curr_secs> (curr_prog.cooling.duration + last_sec)){
+        phase = PHASE_STOP;
+	last_sec = curr_secs;
+	serialWriteStrLn("/////DONE");
+      }
+     break;
+   }
+     
+   
+     //  power_wait = COUNTS(LUT50hz[j]);
+
+     /*  
+	 serialWriteStrLn(buffer+longtobuffer(j,buffer));
+	 serialWriteStrLn(buffer+longtobuffer(power_wait,buffer));
+     */
      //serialWriteLn();
- #endif   
-
-
-     
-     
-     power_wait = COUNTS(LUT50hz[j-1]);
-     serialWriteStrLn(buffer+longtobuffer(j,buffer));
-     serialWriteStrLn(buffer+longtobuffer(power_wait,buffer));
-     j++;
-     j--;
-     serialWriteLn();
      if(dir){
        j+=4;
      }else{
        j-=4;
      }
-     if(j<1)       j=1;
-     if(j>100)     j=100;
+     if(j<0)       j=0;
+     if(j>99)     j=99;
 
-     if((j==0) || (j==100)){
+     if((j==0) || (j==99)){
        dir = !dir;
      }
-     
-     
-     
-
-     
      main_flags &= ~TIMER_FIRED;
-     
-     
    } 
- 
-
-
-}
- 
+ }
  
  return 0;
 }
